@@ -530,18 +530,24 @@ def run_workload(session, scenario_name, simple_count, medium_count, complex_cou
     all_qids = adap_qids + cls_qids
     all_qid_sql = ",".join(["''" + q + "''" for q in all_qids])
 
+    # Poll via connector status (no ACCOUNT_USAGE latency)
+    pending = set(all_qids)
     max_wait = 300
-    while max_wait > 0:
-        time.sleep(5)
-        max_wait -= 5
-        done_count = session.sql(
-            f"SELECT COUNT(*) AS done FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY "
-            f"WHERE QUERY_ID IN ({all_qid_sql}) "
-            f"AND EXECUTION_STATUS IN (''SUCCESS'',''FAILED_WITH_ERROR'',''FAILED_WITH_INCIDENT'')"
-        ).collect()[0]["DONE"]
-        if done_count >= total_per_wh * 2:
-            break
+    elapsed = 0
+    while pending and elapsed < max_wait:
+        time.sleep(3)
+        elapsed += 3
+        done = set()
+        for qid in list(pending):
+            try:
+                status = raw.get_query_status(qid)
+                if not raw.is_still_running(status):
+                    done.add(qid)
+            except Exception:
+                done.add(qid)
+        pending -= done
 
+    # Insert from INFORMATION_SCHEMA (near-real-time, same session)
     session.sql(
         f"INSERT INTO {DB}.ZW_SCH_ADMIN.ZW_RESULTS "
         f"SELECT "
@@ -563,7 +569,7 @@ def run_workload(session, scenario_name, simple_count, medium_count, complex_cou
         f"START_TIME, "
         f"END_TIME, "
         f"''{run_meta_escaped}'' "
-        f"FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY "
+        f"FROM TABLE({DB}.INFORMATION_SCHEMA.QUERY_HISTORY_BY_SESSION()) "
         f"WHERE QUERY_ID IN ({all_qid_sql})"
     ).collect()
 
