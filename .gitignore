@@ -1,0 +1,7 @@
+.DS_Store
+.venv/
+output/
+*.bak
+test.sql
+__pycache__/
+*.pyc

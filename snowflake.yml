@@ -1,0 +1,13 @@
+definition_version: 2
+entities:
+  adaptive_load_tester:
+    type: streamlit
+    identifier:
+      name: ADAPTIVE_LOAD_TESTER
+      database: ZW_DB_ADAPTIVE
+      schema: ZW_SCH_ADMIN
+    query_warehouse: ZW_ADAPTIVE_WH
+    main_file: streamlit_app.py
+    artifacts:
+      - streamlit_app.py
+      - environment.yml
