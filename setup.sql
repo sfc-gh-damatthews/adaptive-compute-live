@@ -569,7 +569,7 @@ def run_workload(session, scenario_name, simple_count, medium_count, complex_cou
         f"START_TIME, "
         f"END_TIME, "
         f"''{run_meta_escaped}'' "
-        f"FROM TABLE({DB}.INFORMATION_SCHEMA.QUERY_HISTORY_BY_SESSION()) "
+        f"FROM TABLE({DB}.INFORMATION_SCHEMA.QUERY_HISTORY_BY_SESSION(RESULT_LIMIT => 10000)) "
         f"WHERE QUERY_ID IN ({all_qid_sql})"
     ).collect()
 
