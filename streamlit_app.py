@@ -46,6 +46,18 @@ SCENARIOS = {
         "description": "150 queries hitting both warehouses simultaneously.",
         "simple": 100, "medium": 40, "complex": 10,
     },
+    "Small Burst": {
+        "description": "100 lightweight queries at once — pure concurrency pressure.",
+        "simple": 100, "medium": 0, "complex": 0,
+    },
+    "Medium Burst": {
+        "description": "50 mid-weight queries at once — balanced concurrency and compute.",
+        "simple": 0, "medium": 50, "complex": 0,
+    },
+    "Complex Burst": {
+        "description": "25 heavy analytical queries at once — maximum compute pressure.",
+        "simple": 0, "medium": 0, "complex": 25,
+    },
 }
 
 def _get_session():
