@@ -445,7 +445,7 @@ CREATE TABLE IF NOT EXISTS ZW_RESULTS (
 -- Stored procedures
 -- =============================================================================
 
-CREATE OR REPLACE PROCEDURE ZW_RUN_WORKLOAD("SCENARIO_NAME" VARCHAR, "SIMPLE_COUNT" NUMBER(38,0), "MEDIUM_COUNT" NUMBER(38,0), "COMPLEX_COUNT" NUMBER(38,0), "ADAPTIVE_WH" VARCHAR, "CLASSIC_WH" VARCHAR)
+CREATE OR REPLACE PROCEDURE ZW_RUN_WORKLOAD("SCENARIO_NAME" VARCHAR, "SIMPLE_COUNT" NUMBER(38,0), "MEDIUM_COUNT" NUMBER(38,0), "COMPLEX_COUNT" NUMBER(38,0), "WH_A" VARCHAR, "WH_B" VARCHAR, "RUN_META_JSON" VARCHAR)
 RETURNS VARCHAR
 LANGUAGE PYTHON
 RUNTIME_VERSION = '3.11'
@@ -455,10 +455,9 @@ EXECUTE AS CALLER
 AS '
 import time
 import uuid
-import json
 from datetime import datetime
 
-def run_workload(session, scenario_name, simple_count, medium_count, complex_count, adaptive_wh, classic_wh):
+def run_workload(session, scenario_name, simple_count, medium_count, complex_count, wh_a, wh_b, run_meta_json):
     DB = "ZW_DB_ADAPTIVE"
     SCH_V = "ZW_SCH_VIEWS"
 
@@ -484,50 +483,32 @@ def run_workload(session, scenario_name, simple_count, medium_count, complex_cou
     run_ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     total_per_wh = len(all_views)
 
-    a_rows = session.sql(f"SHOW WAREHOUSES LIKE ''{adaptive_wh}''").collect()
-    c_rows = session.sql(f"SHOW WAREHOUSES LIKE ''{classic_wh}''").collect()
-    a_meta = a_rows[0].as_dict() if a_rows else {}
-    c_meta = c_rows[0].as_dict() if c_rows else {}
-    run_meta = json.dumps({
-        "adaptive": {
-            "name": adaptive_wh,
-            "type": str(a_meta.get("type", "")),
-            "max_perf": str(a_meta.get("max_query_performance_level", "")),
-            "throughput": str(a_meta.get("query_throughput_multiplier", ""))
-        },
-        "classic": {
-            "name": classic_wh,
-            "type": str(c_meta.get("type", "")),
-            "size": str(c_meta.get("size", "")),
-            "max_clusters": str(c_meta.get("max_cluster_count", ""))
-        },
-        "dataset": "TPCH_SF10"
-    })
-    run_meta_escaped = run_meta.replace("''", "''''")
+    # Metadata (mode, per-side config and labels) is built by the caller
+    run_meta_escaped = (run_meta_json or "{}").replace("''", "''''")
 
     raw = session.connection
 
-    raw.cursor().execute(f"USE WAREHOUSE {adaptive_wh}")
-    adap_qids = []
+    raw.cursor().execute(f"USE WAREHOUSE {wh_a}")
+    a_qids = []
     for v in all_views:
         cur = raw.cursor()
         cur.execute_async(f"SELECT *, RANDOM() AS _nc FROM {DB}.{SCH_V}.{v}")
         qid = cur.sfqid
         if qid:
-            adap_qids.append(qid)
+            a_qids.append(qid)
 
-    raw.cursor().execute(f"USE WAREHOUSE {classic_wh}")
-    cls_qids = []
+    raw.cursor().execute(f"USE WAREHOUSE {wh_b}")
+    b_qids = []
     for v in all_views:
         cur = raw.cursor()
         cur.execute_async(f"SELECT *, RANDOM() AS _nc FROM {DB}.{SCH_V}.{v}")
         qid = cur.sfqid
         if qid:
-            cls_qids.append(qid)
+            b_qids.append(qid)
 
-    raw.cursor().execute(f"USE WAREHOUSE {adaptive_wh}")
+    raw.cursor().execute(f"USE WAREHOUSE {wh_a}")
 
-    all_qids = adap_qids + cls_qids
+    all_qids = a_qids + b_qids
     all_qid_sql = ",".join(["''" + q + "''" for q in all_qids])
 
     # Poll via connector status (no ACCOUNT_USAGE latency)
