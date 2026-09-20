@@ -10,6 +10,10 @@ DB = "ZW_DB_ADAPTIVE"
 SCH_A = "ZW_SCH_ADMIN"
 TPC_DATASET = "TPCH_SF10"
 
+# Neutral warehouse the procedure itself runs on, so its polling and insert
+# overhead is never billed to (or measured against) either side of the comparison.
+DRIVER_WH = "ZW_DRIVER_WH"
+
 # Comparison modes → (side A warehouse type, side B warehouse type)
 MODES = {
     "Adaptive vs Standard": ("adaptive", "standard"),
@@ -280,6 +284,12 @@ if run_clicked:
         "dataset": tpc_dataset,
     }).replace("'", "''")
     with st.spinner(f"Running {total_q * 2} queries across both warehouses..."):
+        # Drive from the neutral warehouse so the CALL itself never executes on a
+        # warehouse under test.
+        try:
+            session.sql(f"USE WAREHOUSE {DRIVER_WH}").collect()
+        except Exception as e:
+            st.warning(f"Could not switch to {DRIVER_WH}: {e}")
         result = session.sql(f"""
             CALL {DB}.{SCH_A}.ZW_RUN_WORKLOAD(
                 '{scenario}', {sc['simple']}, {sc['medium']}, {sc['complex']},

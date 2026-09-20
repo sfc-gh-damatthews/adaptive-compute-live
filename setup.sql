@@ -39,6 +39,17 @@ CREATE OR REPLACE WAREHOUSE ZW_ADAPTIVE_WH
     MAX_QUERY_PERFORMANCE_LEVEL  = SMALL
     QUERY_THROUGHPUT_MULTIPLIER  = 5;
 
+-- Driver: the app and ZW_RUN_WORKLOAD run here, never on a warehouse under test.
+-- The procedure spends most of its life polling for async query completion; billing
+-- that to a measured warehouse would both cost money and skew the comparison.
+CREATE WAREHOUSE IF NOT EXISTS ZW_DRIVER_WH
+  WITH
+    WAREHOUSE_TYPE = 'STANDARD'
+    WAREHOUSE_SIZE = 'XSMALL'
+    AUTO_SUSPEND   = 60
+    AUTO_RESUME    = TRUE
+    COMMENT        = 'Neutral driver warehouse for ZW_RUN_WORKLOAD.';
+
 -- =============================================================================
 -- Admin: execution log
 -- =============================================================================
@@ -455,6 +466,7 @@ EXECUTE AS CALLER
 AS '
 import time
 import uuid
+import json
 from datetime import datetime
 
 def run_workload(session, scenario_name, simple_count, medium_count, complex_count, wh_a, wh_b, run_meta_json):
@@ -483,30 +495,85 @@ def run_workload(session, scenario_name, simple_count, medium_count, complex_cou
     run_ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     total_per_wh = len(all_views)
 
-    # Metadata (mode, per-side config and labels) is built by the caller
     run_meta_escaped = (run_meta_json or "{}").replace("''", "''''")
+
+    # Labels come from the caller metadata; fall back to warehouse names
+    try:
+        _m = json.loads(run_meta_json or "{}")
+    except Exception:
+        _m = {}
+    label_a = str((_m.get("side_a") or {}).get("label", wh_a))
+    label_b = str((_m.get("side_b") or {}).get("label", wh_b))
 
     raw = session.connection
 
-    raw.cursor().execute(f"USE WAREHOUSE {wh_a}")
+    def sql(stmt):
+        raw.cursor().execute(stmt)
+
+    def set_tag(side, wh, label):
+        # QUERY_TAG lands in QUERY_HISTORY and QUERY_ATTRIBUTION_HISTORY, so the
+        # workload queries can be costed per side and joined back on run_id.
+        try:
+            tag = json.dumps({
+                "demo": "zw_adaptive_compare",
+                "run_id": run_id,
+                "scenario": scenario_name,
+                "side": side,
+                "wh": wh,
+                "label": label
+            }).replace("''", "''''")
+            sql("ALTER SESSION SET QUERY_TAG = ''" + tag + "''")
+        except Exception:
+            pass
+
+    def clear_tag():
+        try:
+            sql("ALTER SESSION UNSET QUERY_TAG")
+        except Exception:
+            pass
+
+    # Remember the caller warehouse. Without this the USE WAREHOUSE below leaks
+    # into the session, so the next CALL executes on a warehouse under test and
+    # charges its polling time to one side of the comparison.
+    orig_wh = None
+    try:
+        row = raw.cursor().execute("SELECT CURRENT_WAREHOUSE()").fetchone()
+        orig_wh = row[0] if row and row[0] else None
+    except Exception:
+        pass
+
+    def target(wh, side, label):
+        # Clear before switching so the USE WAREHOUSE statement itself is not
+        # attributed to the wrong side, then tag only the workload that follows.
+        clear_tag()
+        sql("USE WAREHOUSE " + wh)
+        set_tag(side, wh, label)
+
     a_qids = []
-    for v in all_views:
-        cur = raw.cursor()
-        cur.execute_async(f"SELECT *, RANDOM() AS _nc FROM {DB}.{SCH_V}.{v}")
-        qid = cur.sfqid
-        if qid:
-            a_qids.append(qid)
-
-    raw.cursor().execute(f"USE WAREHOUSE {wh_b}")
     b_qids = []
-    for v in all_views:
-        cur = raw.cursor()
-        cur.execute_async(f"SELECT *, RANDOM() AS _nc FROM {DB}.{SCH_V}.{v}")
-        qid = cur.sfqid
-        if qid:
-            b_qids.append(qid)
+    try:
+        target(wh_a, "A", label_a)
+        for v in all_views:
+            cur = raw.cursor()
+            cur.execute_async("SELECT *, RANDOM() AS _nc FROM " + DB + "." + SCH_V + "." + v)
+            if cur.sfqid:
+                a_qids.append(cur.sfqid)
 
-    raw.cursor().execute(f"USE WAREHOUSE {wh_a}")
+        target(wh_b, "B", label_b)
+        for v in all_views:
+            cur = raw.cursor()
+            cur.execute_async("SELECT *, RANDOM() AS _nc FROM " + DB + "." + SCH_V + "." + v)
+            if cur.sfqid:
+                b_qids.append(cur.sfqid)
+    finally:
+        # Hand the session back before polling so the wait and the INSERT are not
+        # billed to either warehouse under test.
+        clear_tag()
+        if orig_wh:
+            try:
+                sql("USE WAREHOUSE " + orig_wh)
+            except Exception:
+                pass
 
     all_qids = a_qids + b_qids
     all_qid_sql = ",".join(["''" + q + "''" for q in all_qids])
