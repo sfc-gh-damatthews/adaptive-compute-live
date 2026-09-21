@@ -325,7 +325,10 @@ def _wh_summary(info, wh_type):
     if not info:
         return "_not found — use Create Both_"
     state = info.get("state", "—")
-    if wh_type == "adaptive":
+    # Report against the live type, not the sidebar's, so a warehouse that is
+    # currently the other type is described with its own fields.
+    live_type = str(info.get("type", "")).upper()
+    if live_type == "ADAPTIVE":
         return (
             f"State: **{state}** · Max Perf: **{info.get('max_query_performance_level', '—')}** · "
             f"Throughput: **{info.get('query_throughput_multiplier', '—')}x**"
@@ -337,16 +340,53 @@ def _wh_summary(info, wh_type):
     )
 
 
+def label_from_info(info, wh_type):
+    """Label derived from the live warehouse rather than the sidebar, so both the
+    display and the recorded metadata describe what will actually run. Returns
+    None when the warehouse does not exist yet."""
+    if not info:
+        return None
+    live_type = str(info.get("type", "")).upper()
+    if live_type == "ADAPTIVE":
+        perf = str(info.get("max_query_performance_level", "?")).upper().replace("-", "")
+        thr = info.get("query_throughput_multiplier", "?")
+        try:
+            thr_s = "unlimited" if int(thr) == 0 else f"{int(thr)}x"
+        except (TypeError, ValueError):
+            thr_s = f"{thr}x"
+        return f"Adaptive {perf} {thr_s}"
+    size = str(info.get("size", "?")).upper().replace("-", "")
+    return f"Gen{info.get('generation', '?')} {size} {info.get('max_cluster_count', '?')}cl"
+
+
 a_info = _wh_info(wh_a)
 b_info = _wh_info(wh_b)
 
+# Prefer the live definition. The sidebar only expresses intent until Create Both
+# has been run, and labelling a run with unapplied config would record results
+# against a configuration that never executed.
+live_label_a = label_from_info(a_info, type_a)
+live_label_b = label_from_info(b_info, type_b)
+eff_label_a = live_label_a or label_a
+eff_label_b = live_label_b or label_b
+
+drift_a = live_label_a is not None and live_label_a != label_a
+drift_b = live_label_b is not None and live_label_b != label_b
+
 col_a, col_b = st.columns(2)
-with col_a:
-    st.markdown(f"**🔵 {label_a}** — `{wh_a}`")
-    st.caption(_wh_summary(a_info, type_a))
-with col_b:
-    st.markdown(f"**🟠 {label_b}** — `{wh_b}`")
-    st.caption(_wh_summary(b_info, type_b))
+for col, dot, eff, wh, info, wh_type, drift, want in [
+    (col_a, "🔵", eff_label_a, wh_a, a_info, type_a, drift_a, label_a),
+    (col_b, "🟠", eff_label_b, wh_b, b_info, type_b, drift_b, label_b),
+]:
+    with col:
+        st.markdown(f"**{dot} {eff}** — `{wh}`")
+        st.caption(_wh_summary(info, wh_type))
+        if drift:
+            st.warning(f"Live warehouse is **{eff}**, sidebar is set to **{want}**. "
+                       f"Click **Create Both** to apply, or results will be recorded as {eff}.")
+
+if drift_a or drift_b:
+    st.caption("_Labels above reflect the live warehouses, not the pending sidebar config._")
 
 
 # ── Controls ──────────────────────────────────────────────────────────────────
@@ -374,11 +414,13 @@ if run_clicked:
     if same_name:
         st.error("Side A and Side B must use different warehouse names.")
         st.stop()
+    # Record the live labels so stored results always describe the warehouses that
+    # actually ran, even if the sidebar holds unapplied changes.
     run_meta = json.dumps({
         "mode": mode,
-        "side_a": {"name": wh_a, "type": type_a, "label": label_a,
+        "side_a": {"name": wh_a, "type": type_a, "label": eff_label_a,
                    **{k: str(v) for k, v in cfg_a.items()}},
-        "side_b": {"name": wh_b, "type": type_b, "label": label_b,
+        "side_b": {"name": wh_b, "type": type_b, "label": eff_label_b,
                    **{k: str(v) for k, v in cfg_b.items()}},
         "dataset": tpc_dataset,
     }).replace("'", "''")
@@ -453,7 +495,7 @@ def _build_run_label(row):
             parts.append(dataset)
         parts.append(ts)
         return " — ".join(parts)
-    return f"{row['SCENARIO']} — {label_a} vs {label_b} — {TPC_DATASET} — {ts}"
+    return f"{row['SCENARIO']} — {eff_label_a} vs {eff_label_b} — {TPC_DATASET} — {ts}"
 
 runs_df["LABEL"] = runs_df.apply(_build_run_label, axis=1)
 run_options = runs_df["LABEL"].tolist()
@@ -495,8 +537,8 @@ _sa, _sb, _ = _meta_sides(_sel_meta)
 
 run_wh_a = (_sa or {}).get("name") or wh_a
 run_wh_b = (_sb or {}).get("name") or wh_b
-run_label_a = (_sa or {}).get("label") or label_a
-run_label_b = (_sb or {}).get("label") or label_b
+run_label_a = (_sa or {}).get("label") or eff_label_a
+run_label_b = (_sb or {}).get("label") or eff_label_b
 
 a_df = df[df["WAREHOUSE_NAME"] == run_wh_a].copy()
 b_df = df[df["WAREHOUSE_NAME"] == run_wh_b].copy()
