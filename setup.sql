@@ -495,9 +495,48 @@ def run_workload(session, scenario_name, simple_count, medium_count, complex_cou
     run_ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     total_per_wh = len(all_views)
 
+    # SHOW WAREHOUSES reports sizes with different keywords to the DDL
+    SIZE_ALIASES = {"2XLARGE": "XXLARGE", "3XLARGE": "XXXLARGE", "4XLARGE": "X4LARGE"}
+
+    def canon_size(raw_size):
+        s = str(raw_size).upper().replace("-", "").replace(" ", "")
+        return SIZE_ALIASES.get(s, s)
+
+    def describe(name):
+        # Build a label from the live warehouse, so calling this procedure straight
+        # from SQL still records what actually ran.
+        try:
+            rows = session.sql("SHOW WAREHOUSES LIKE ''" + name + "''").collect()
+            m = rows[0].as_dict() if rows else {}
+        except Exception:
+            m = {}
+        wtype = str(m.get("type", "")).upper()
+        if wtype == "ADAPTIVE":
+            perf = canon_size(m.get("max_query_performance_level", "?"))
+            thr = m.get("query_throughput_multiplier", "?")
+            try:
+                thr_s = "unlimited" if int(thr) == 0 else str(int(thr)) + "x"
+            except (TypeError, ValueError):
+                thr_s = str(thr) + "x"
+            return {"name": name, "type": "adaptive", "label": "Adaptive " + perf + " " + thr_s}
+        gen = str(m.get("generation", "?"))
+        size = canon_size(m.get("size", "?"))
+        maxc = str(m.get("max_cluster_count", "?"))
+        return {"name": name, "type": "standard",
+                "label": "Gen" + gen + " " + size + " " + maxc + "cl"}
+
+    # Callers that already know the config (the Streamlit app) pass it in. Called
+    # directly from SQL the argument is NULL, so derive it here instead.
+    if not run_meta_json:
+        run_meta_json = json.dumps({
+            "mode": "direct SQL",
+            "side_a": describe(wh_a),
+            "side_b": describe(wh_b),
+            "dataset": "TPCH_SF10"
+        })
+
     run_meta_escaped = (run_meta_json or "{}").replace("''", "''''")
 
-    # Labels come from the caller metadata; fall back to warehouse names
     try:
         _m = json.loads(run_meta_json or "{}")
     except Exception:
@@ -656,3 +695,222 @@ def run(session, warehouse_name, n_simple, n_medium, n_complex):
             session.sql(sql).collect_nowait()
     return f''Fired {len(views)} queries to {warehouse_name}''
 ';
+
+-- =============================================================================
+-- Analysis views
+-- =============================================================================
+
+-- One row per run per warehouse. Turns comparison into a single SELECT.
+CREATE OR REPLACE VIEW ZW_V_RUN_SUMMARY AS
+SELECT
+    r.RUN_ID,
+    r.RUN_TS,
+    r.SCENARIO,
+    r.WAREHOUSE_NAME,
+    -- Side identity and labels come from the run's own metadata, so historic runs
+    -- describe the configuration they actually used. Falls back to the legacy
+    -- adaptive/classic keys for rows written before the side_a/side_b schema.
+    COALESCE(
+        GET_PATH(TRY_PARSE_JSON(r.RUN_META), 'side_a.name')::VARCHAR,
+        GET_PATH(TRY_PARSE_JSON(r.RUN_META), 'adaptive.name')::VARCHAR
+    )                                              AS SIDE_A_WH,
+    COALESCE(
+        GET_PATH(TRY_PARSE_JSON(r.RUN_META), 'side_b.name')::VARCHAR,
+        GET_PATH(TRY_PARSE_JSON(r.RUN_META), 'classic.name')::VARCHAR
+    )                                              AS SIDE_B_WH,
+    COALESCE(
+        GET_PATH(TRY_PARSE_JSON(r.RUN_META), 'side_a.label')::VARCHAR,
+        GET_PATH(TRY_PARSE_JSON(r.RUN_META), 'adaptive.label')::VARCHAR
+    )                                              AS SIDE_A_LABEL,
+    COALESCE(
+        GET_PATH(TRY_PARSE_JSON(r.RUN_META), 'side_b.label')::VARCHAR,
+        GET_PATH(TRY_PARSE_JSON(r.RUN_META), 'classic.label')::VARCHAR
+    )                                              AS SIDE_B_LABEL,
+    COUNT(*)                                       AS QUERIES,
+    ROUND(AVG(r.EXEC_SEC), 2)                      AS AVG_EXEC_SEC,
+    ROUND(AVG(r.QUEUED_SEC), 2)                    AS AVG_QUEUE_SEC,
+    ROUND(MAX(r.QUEUED_SEC), 2)                    AS MAX_QUEUE_SEC,
+    ROUND(AVG(r.ELAPSED_SEC), 2)                   AS AVG_ELAPSED_SEC,
+    ROUND(APPROX_PERCENTILE(r.EXEC_SEC, 0.90), 2)  AS P90_EXEC_SEC,
+    ROUND(MAX(r.EXEC_SEC), 2)                      AS MAX_EXEC_SEC
+FROM ZW_RESULTS r
+WHERE r.EXECUTION_STATUS = 'SUCCESS'
+GROUP BY 1, 2, 3, 4, 5, 6, 7, 8;
+
+-- Side-by-side: one row per run with both warehouses on the same line.
+CREATE OR REPLACE VIEW ZW_V_RUN_COMPARISON AS
+WITH s AS (SELECT * FROM ZW_V_RUN_SUMMARY)
+SELECT
+    a.RUN_TS,
+    a.SCENARIO,
+    a.SIDE_A_LABEL                           AS SIDE_A,
+    b.SIDE_B_LABEL                           AS SIDE_B,
+    a.QUERIES                                AS QUERIES_PER_SIDE,
+    a.AVG_EXEC_SEC                           AS A_AVG_EXEC,
+    b.AVG_EXEC_SEC                           AS B_AVG_EXEC,
+    a.AVG_QUEUE_SEC                          AS A_AVG_QUEUE,
+    b.AVG_QUEUE_SEC                          AS B_AVG_QUEUE,
+    a.AVG_ELAPSED_SEC                        AS A_AVG_ELAPSED,
+    b.AVG_ELAPSED_SEC                        AS B_AVG_ELAPSED,
+    -- >1 means side B was slower end to end
+    ROUND(b.AVG_ELAPSED_SEC / NULLIF(a.AVG_ELAPSED_SEC, 0), 2) AS B_OVER_A_ELAPSED,
+    a.RUN_ID
+FROM s a
+JOIN s b
+  ON a.RUN_ID = b.RUN_ID
+ AND a.WAREHOUSE_NAME = a.SIDE_A_WH
+ AND b.WAREHOUSE_NAME = b.SIDE_B_WH;
+
+-- =============================================================================
+-- DEMO USAGE
+--
+-- Everything above is setup and only needs running once. From here down the
+-- statements are the demo itself: reconfigure the pair, fire a burst, compare.
+--
+-- Always drive from ZW_DRIVER_WH. The procedure spends most of its life polling
+-- for async completion, and running that on a warehouse under test would both
+-- cost credits and skew its own measurement.
+--
+-- Two adaptive properties matter, and they are orthogonal, so each needs the
+-- opposite shape of workload to show up:
+--
+--   QUERY_THROUGHPUT_MULTIPLIER  how much runs at once -> many cheap queries
+--   MAX_QUERY_PERFORMANCE_LEVEL  how fast one query goes -> few heavy queries
+-- =============================================================================
+
+USE WAREHOUSE ZW_DRIVER_WH;
+USE SCHEMA ZW_DB_ADAPTIVE.ZW_SCH_ADMIN;
+
+-- Pass NULL for the last argument and the procedure describes the warehouses
+-- itself from SHOW WAREHOUSES. The Streamlit app passes real JSON instead, since
+-- it already knows the configuration it applied.
+--
+-- (A 6-argument SQL wrapper was tried so NULL could be omitted, but a SQL
+-- procedure calling this Python one runs it without caller rights, which breaks
+-- its USE WAREHOUSE. Passing NULL explicitly avoids that.)
+
+
+-- -----------------------------------------------------------------------------
+-- Demo 1: Standard vs Adaptive
+--
+-- Matched cost envelope. 100 light queries swamp Standard's ~24 concurrent slots
+-- (MAX_CONCURRENCY_LEVEL 8 x 3 clusters) while Adaptive absorbs them.
+--
+-- Expect: AVG_EXEC near identical on both, which is the control that proves
+-- neither side got more per-query compute. The whole difference lands in
+-- AVG_QUEUE. Measured 0.0s vs 6.1s, worst case 18.5s.
+-- -----------------------------------------------------------------------------
+CREATE OR REPLACE WAREHOUSE ZW_ADAPTIVE_WH
+    WAREHOUSE_TYPE = 'ADAPTIVE'
+    MAX_QUERY_PERFORMANCE_LEVEL = SMALL
+    QUERY_THROUGHPUT_MULTIPLIER = 5;
+
+CREATE OR REPLACE WAREHOUSE ZW_CLASSIC_WH
+    WAREHOUSE_TYPE = 'STANDARD'
+    WAREHOUSE_SIZE = 'SMALL'
+    GENERATION = '2'
+    MIN_CLUSTER_COUNT = 1
+    MAX_CLUSTER_COUNT = 3
+    SCALING_POLICY = 'STANDARD'
+    MAX_CONCURRENCY_LEVEL = 8
+    AUTO_SUSPEND = 60
+    AUTO_RESUME = TRUE
+    ENABLE_QUERY_ACCELERATION = TRUE;
+
+USE WAREHOUSE ZW_DRIVER_WH;
+CALL ZW_RUN_WORKLOAD('Small Burst', 100, 0, 0, 'ZW_ADAPTIVE_WH', 'ZW_CLASSIC_WH', NULL);
+
+-- -----------------------------------------------------------------------------
+-- Demo 2: Query throughput multiplier
+--
+-- Both sides adaptive at the same performance level, so the multiplier is the
+-- only variable.
+--
+-- Expect: AVG_QUEUE diverges (measured 1.5s at 2x vs 0.0s at 10x) while AVG_EXEC
+-- moves far less. The multiplier buys admission, not speed. Exec does shift a
+-- little because queued queries land in a busier warehouse.
+-- -----------------------------------------------------------------------------
+CREATE OR REPLACE WAREHOUSE ZW_ADAPTIVE_WH
+    WAREHOUSE_TYPE = 'ADAPTIVE'
+    MAX_QUERY_PERFORMANCE_LEVEL = LARGE
+    QUERY_THROUGHPUT_MULTIPLIER = 2;
+
+CREATE OR REPLACE WAREHOUSE ZW_WH_B
+    WAREHOUSE_TYPE = 'ADAPTIVE'
+    MAX_QUERY_PERFORMANCE_LEVEL = LARGE
+    QUERY_THROUGHPUT_MULTIPLIER = 10;
+
+USE WAREHOUSE ZW_DRIVER_WH;
+CALL ZW_RUN_WORKLOAD('Small Burst', 100, 0, 0, 'ZW_ADAPTIVE_WH', 'ZW_WH_B', NULL);
+
+-- -----------------------------------------------------------------------------
+-- Demo 3: Max query performance level
+--
+-- Both sides adaptive at the same multiplier. Only 3 queries, so queuing cannot
+-- account for any difference.
+--
+-- Expect: AVG_EXEC drops sharply on the X4LARGE side (measured 10.9s vs 2.6s)
+-- with queue at 0.0s on both. Note Snowflake only optimises up to the ceiling
+-- when it is confident, so a higher ceiling permits speed rather than
+-- guaranteeing it.
+-- -----------------------------------------------------------------------------
+CREATE OR REPLACE WAREHOUSE ZW_ADAPTIVE_WH
+    WAREHOUSE_TYPE = 'ADAPTIVE'
+    MAX_QUERY_PERFORMANCE_LEVEL = XSMALL
+    QUERY_THROUGHPUT_MULTIPLIER = 4;
+
+CREATE OR REPLACE WAREHOUSE ZW_WH_B
+    WAREHOUSE_TYPE = 'ADAPTIVE'
+    MAX_QUERY_PERFORMANCE_LEVEL = X4LARGE
+    QUERY_THROUGHPUT_MULTIPLIER = 4;
+
+USE WAREHOUSE ZW_DRIVER_WH;
+CALL ZW_RUN_WORKLOAD('Heavy Single', 0, 0, 3, 'ZW_ADAPTIVE_WH', 'ZW_WH_B', NULL);
+
+-- =============================================================================
+-- RESULTS
+-- =============================================================================
+
+-- Side by side, most recent first
+SELECT * FROM ZW_V_RUN_COMPARISON ORDER BY RUN_TS DESC;
+
+-- Per warehouse detail
+SELECT * FROM ZW_V_RUN_SUMMARY ORDER BY RUN_TS DESC, WAREHOUSE_NAME;
+
+-- Break a single run down by query complexity
+SELECT WAREHOUSE_NAME, COMPLEXITY, COUNT(*) AS QUERIES,
+       ROUND(AVG(EXEC_SEC), 2)   AS AVG_EXEC_SEC,
+       ROUND(AVG(QUEUED_SEC), 2) AS AVG_QUEUE_SEC
+FROM ZW_RESULTS
+WHERE RUN_ID = (SELECT RUN_ID FROM ZW_RESULTS ORDER BY RUN_TS DESC LIMIT 1)
+  AND EXECUTION_STATUS = 'SUCCESS'
+GROUP BY 1, 2
+ORDER BY 1, 2;
+
+-- Credits per side for the last run. Workload queries carry a JSON QUERY_TAG,
+-- and QUERY_TAG reaches QUERY_ATTRIBUTION_HISTORY, which is per query and does
+-- carry credits. Note QUERY_TAG does NOT reach WAREHOUSE_METERING_HISTORY, so
+-- this is not a general chargeback mechanism.
+-- Adaptive credits surface via QUERY_METERING_HISTORY instead, with up to an
+-- hour of latency, so the adaptive side may be empty immediately after a run.
+SELECT
+    GET_PATH(TRY_PARSE_JSON(QUERY_TAG), 'side')::VARCHAR  AS SIDE,
+    GET_PATH(TRY_PARSE_JSON(QUERY_TAG), 'label')::VARCHAR AS LABEL,
+    WAREHOUSE_NAME,
+    COUNT(*)                                              AS QUERIES,
+    ROUND(SUM(CREDITS_ATTRIBUTED_COMPUTE), 6)             AS CREDITS
+FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_ATTRIBUTION_HISTORY
+WHERE QUERY_TAG ILIKE '%zw_adaptive_compare%'
+  AND START_TIME >= DATEADD('hour', -24, CURRENT_TIMESTAMP())
+GROUP BY 1, 2, 3
+ORDER BY 1;
+
+-- =============================================================================
+-- TEARDOWN
+-- =============================================================================
+-- DROP WAREHOUSE IF EXISTS ZW_ADAPTIVE_WH;
+-- DROP WAREHOUSE IF EXISTS ZW_CLASSIC_WH;
+-- DROP WAREHOUSE IF EXISTS ZW_WH_A;
+-- DROP WAREHOUSE IF EXISTS ZW_WH_B;
+-- DROP WAREHOUSE IF EXISTS ZW_DRIVER_WH;
+-- DROP DATABASE IF EXISTS ZW_DB_ADAPTIVE;
