@@ -62,6 +62,66 @@ SCENARIOS = {
         "description": "25 heavy analytical queries at once — maximum compute pressure.",
         "simple": 0, "medium": 0, "complex": 25,
     },
+    "Heavy Single": {
+        "description": "3 heavy queries only — low concurrency, so per-query speed is isolated from queuing.",
+        "simple": 0, "medium": 0, "complex": 3,
+    },
+}
+
+# Preset configurations for the three headline demos. Each sets the comparison
+# mode, both sides' tuning, and the scenario that actually exposes the mechanism.
+DEMO_PRESETS = {
+    "Custom (manual setup)": None,
+    "1 · Standard vs Adaptive": {
+        "mode": "Adaptive vs Standard",
+        "scenario": "Small Burst",
+        "wh_a": "ZW_ADAPTIVE_WH",
+        "wh_b": "ZW_CLASSIC_WH",
+        "a": {"max_perf": "SMALL", "throughput": 5},
+        "b": {"size": "SMALL", "generation": "2", "min_clusters": 1, "max_clusters": 3,
+              "scaling_policy": "STANDARD", "max_concurrency": 8,
+              "qas": True, "qas_scale": 8, "auto_suspend": 60, "auto_resume": True},
+        "watch": "**Avg Exec is near identical** (3.5s vs 3.6s measured) which proves neither "
+                 "side got more per-query compute — so the whole difference is **Queue**: 0.0s vs "
+                 "6.1s average, 18.5s worst case, and Avg Elapsed 4.5s vs 10.1s. 100 light queries "
+                 "swamp Standard's ~24 concurrent slots (8 x 3 clusters). Watch the **Outstanding "
+                 "Queries** curve: the Standard plateau is cluster spin-up lag, which Adaptive "
+                 "does not have.",
+    },
+    "2 · Query Throughput Multiplier": {
+        "mode": "Adaptive vs Adaptive",
+        "scenario": "Small Burst",
+        "wh_a": "ZW_ADAPTIVE_WH",
+        "wh_b": "ZW_WH_B",
+        "a": {"max_perf": "LARGE", "throughput": 2},
+        "b": {"max_perf": "LARGE", "throughput": 10},
+        "watch": "**Avg Queue** is where the effect concentrates — measured 1.5s at 2x "
+                 "versus 0.0s at 10x, with Avg Elapsed 3.5s versus 1.4s. Perf level is held "
+                 "identical, so the multiplier is the only variable: it buys admission, not "
+                 "raw speed. Exec time does shift a little too (1.3s versus 0.9s) since queued "
+                 "queries land in a more contended warehouse. Use Panic for a wider gap.",
+    },
+    "3 · Max Query Performance Level": {
+        "mode": "Adaptive vs Adaptive",
+        "scenario": "Heavy Single",
+        "wh_a": "ZW_ADAPTIVE_WH",
+        "wh_b": "ZW_WH_B",
+        "a": {"max_perf": "XSMALL", "throughput": 4},
+        "b": {"max_perf": "X4LARGE", "throughput": 4},
+        "watch": "**Avg / P90 / Max Exec** drop sharply on the X4LARGE side — measured 10.9s "
+                 "versus 2.6s, a 4.2x gap — with **Queue at 0.0s on both**. Multiplier is held "
+                 "identical and only 3 queries run, so neither queuing nor admission can explain "
+                 "it: this is purely per-query performance headroom.",
+    },
+}
+
+# cfg field -> render_config widget key suffix
+FIELD_KEYS = {
+    "max_perf": "perf", "throughput": "thr",
+    "size": "size", "generation": "gen", "min_clusters": "minc", "max_clusters": "maxc",
+    "scaling_policy": "scale", "max_concurrency": "conc",
+    "qas": "qas", "qas_scale": "qasf", "auto_suspend": "susp", "auto_resume": "res",
+    "stmt_timeout": "stmt", "queued_timeout": "qd",
 }
 
 def _get_session():
@@ -178,9 +238,38 @@ def render_config(side, wh_type, default_name):
     return name, cfg
 
 
+def apply_preset(preset):
+    """Push a preset into the widget session state. Must run before the widgets
+    are instantiated, so callers rerun immediately afterwards."""
+    type_a, type_b = MODES[preset["mode"]]
+    st.session_state["mode_select"] = preset["mode"]
+    st.session_state["scenario_select"] = preset["scenario"]
+    for side, wh_type, cfg, name in [
+        ("a", type_a, preset["a"], preset["wh_a"]),
+        ("b", type_b, preset["b"], preset["wh_b"]),
+    ]:
+        k = f"{side}_{wh_type}_"
+        st.session_state[f"{k}name"] = name
+        for field, val in cfg.items():
+            suffix = FIELD_KEYS.get(field)
+            if suffix:
+                st.session_state[f"{k}{suffix}"] = val
+
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("Setup")
+
+    preset_name = st.selectbox("Demo preset", list(DEMO_PRESETS.keys()), key="preset_select")
+    preset = DEMO_PRESETS[preset_name]
+    if preset:
+        st.caption(preset["watch"].replace("**", ""))
+        if st.button("Apply preset", use_container_width=True):
+            apply_preset(preset)
+            st.session_state["active_preset"] = preset_name
+            st.rerun()
+
+    st.divider()
 
     mode = st.selectbox("Comparison mode", list(MODES.keys()), key="mode_select")
     type_a, type_b = MODES[mode]
@@ -270,6 +359,16 @@ with btn_col:
 sc = SCENARIOS[scenario]
 total_q = sc["simple"] + sc["medium"] + sc["complex"]
 st.caption(f"*{sc['description']}* — **{total_q}** queries/wh: {sc['simple']}S · {sc['medium']}M · {sc['complex']}C")
+
+# Show the preset's guidance once it has actually been applied, so it cannot
+# describe a configuration that is no longer loaded.
+_active = st.session_state.get("active_preset")
+if _active and DEMO_PRESETS.get(_active):
+    _p = DEMO_PRESETS[_active]
+    if mode == _p["mode"] and scenario == _p["scenario"]:
+        st.info(f"**{_active}** — what to watch: {_p['watch']}")
+    else:
+        st.caption(f"_Preset **{_active}** loaded, but mode or scenario has since been changed._")
 
 if run_clicked:
     if same_name:
