@@ -5,3 +5,6 @@ output/
 test.sql
 __pycache__/
 *.pyc
+
+# Local tooling working files (Cortex Code plans, session artifacts)
+.snowflake/
