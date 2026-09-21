@@ -24,6 +24,20 @@ MODES = {
 # Adaptive MAX_QUERY_PERFORMANCE_LEVEL and standard WAREHOUSE_SIZE share this scale
 SIZES = ["XSMALL", "SMALL", "MEDIUM", "LARGE", "XLARGE", "XXLARGE", "XXXLARGE", "X4LARGE"]
 
+# SHOW WAREHOUSES reports sizes differently to the DDL keywords: "4X-Large" for
+# X4LARGE, "2X-Large" for XXLARGE and so on. Normalise so a live warehouse can be
+# compared against the sidebar without reporting spurious drift.
+SIZE_ALIASES = {
+    "2XLARGE": "XXLARGE",
+    "3XLARGE": "XXXLARGE",
+    "4XLARGE": "X4LARGE",
+}
+
+
+def canon_size(raw):
+    s = str(raw).upper().replace("-", "").replace(" ", "")
+    return SIZE_ALIASES.get(s, s)
+
 
 SCENARIOS = {
     "Morning Rush": {
@@ -123,6 +137,10 @@ FIELD_KEYS = {
     "qas": "qas", "qas_scale": "qasf", "auto_suspend": "susp", "auto_resume": "res",
     "stmt_timeout": "stmt", "queued_timeout": "qd",
 }
+
+# Presets only state what the demo needs; these match the render_config defaults
+# so build_create_sql always receives a complete config.
+CFG_DEFAULTS = {"stmt_timeout": 3600, "queued_timeout": 0}
 
 def _get_session():
     try:
@@ -262,11 +280,37 @@ with st.sidebar:
 
     preset_name = st.selectbox("Demo preset", list(DEMO_PRESETS.keys()), key="preset_select")
     preset = DEMO_PRESETS[preset_name]
+
+    # Outcome of the previous apply, stashed across the rerun that reloads widgets
+    _res = st.session_state.pop("preset_result", None)
+    if _res:
+        if _res["errors"]:
+            for msg in _res["errors"]:
+                st.error(msg)
+        else:
+            st.success(f"Applied {_res['name']} — both warehouses created")
+
     if preset:
         st.caption(preset["watch"].replace("**", ""))
-        if st.button("Apply preset", use_container_width=True):
+        if st.button("Apply preset & create warehouses", use_container_width=True,
+                     type="primary"):
             apply_preset(preset)
+            p_type_a, p_type_b = MODES[preset["mode"]]
+            errors = []
+            with st.spinner("Creating warehouses..."):
+                for side, name, wh_type, cfg in [
+                    ("A", preset["wh_a"], p_type_a, preset["a"]),
+                    ("B", preset["wh_b"], p_type_b, preset["b"]),
+                ]:
+                    merged = dict(CFG_DEFAULTS)
+                    merged.update(cfg)
+                    try:
+                        session.sql(build_create_sql(name, wh_type, merged)).collect()
+                    except Exception as e:
+                        errors.append(f"Side {side} ({name}): {e}")
             st.session_state["active_preset"] = preset_name
+            st.session_state["preset_result"] = {"name": preset_name, "errors": errors}
+            st.cache_data.clear()
             st.rerun()
 
     st.divider()
@@ -348,15 +392,15 @@ def label_from_info(info, wh_type):
         return None
     live_type = str(info.get("type", "")).upper()
     if live_type == "ADAPTIVE":
-        perf = str(info.get("max_query_performance_level", "?")).upper().replace("-", "")
+        perf = canon_size(info.get("max_query_performance_level", "?"))
         thr = info.get("query_throughput_multiplier", "?")
         try:
             thr_s = "unlimited" if int(thr) == 0 else f"{int(thr)}x"
         except (TypeError, ValueError):
             thr_s = f"{thr}x"
         return f"Adaptive {perf} {thr_s}"
-    size = str(info.get("size", "?")).upper().replace("-", "")
-    return f"Gen{info.get('generation', '?')} {size} {info.get('max_cluster_count', '?')}cl"
+    return (f"Gen{info.get('generation', '?')} {canon_size(info.get('size', '?'))} "
+            f"{info.get('max_cluster_count', '?')}cl")
 
 
 a_info = _wh_info(wh_a)
